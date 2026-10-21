@@ -1,6 +1,13 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
+  ErrorCode,
+  McpError,
+} from '@modelcontextprotocol/sdk/types.js';
 import { MCP_ERROR_CODES, McpErrorCode, classifyPaidCallError } from './codes.js';
 import { SpendBudget } from './budget.js';
 import { checkPaidCallTarget, parsePaidCallAllowlist, type PaidCallAllowRule } from './paidCallAllowlist.js';
@@ -14,6 +21,7 @@ import {
 import { fetchWithTimeout } from '../fetch.js';
 import { config } from '../config.js';
 import { ssrfSafeFetch, SsrfError, type SsrfFetchOptions } from '../net/ssrf.js';
+import { defaultResources, snapshotResource, type LensResourceDescriptor } from './resources.js';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 
@@ -90,6 +98,14 @@ export interface McpServerConfig {
    * tests can drive DNS resolution and the transport without real sockets.
    */
   bazaarFetch?: Partial<SsrfFetchOptions>;
+  /**
+   * The read-only resources this server advertises. Defaults to the stable
+   * Lens facts derived from `config` and the on-disk OpenAPI document; pass a
+   * custom set to serve richer runtime state (a live health check, the runtime
+   * pair registry) without giving the stdio server a database dependency — the
+   * same split `priceQueries` makes for {@link LENS_PRICE_TOOL_NAME}.
+   */
+  resources?: LensResourceDescriptor[];
 }
 
 export class BazaarMcpServer {
@@ -99,6 +115,7 @@ export class BazaarMcpServer {
   private bazaarFetchOptions: SsrfFetchOptions;
   private priceQueries?: LensPriceQueries;
   private budget?: SpendBudget;
+  private resources: LensResourceDescriptor[];
 
   constructor(config_: McpServerConfig) {
     this.fetchWithPayment = config_.fetchWithPayment;
@@ -120,6 +137,8 @@ export class BazaarMcpServer {
       fetchImpl: (input, init) => fetchWithTimeout(input, init),
       ...config_.bazaarFetch,
     };
+    this.resources =
+      config_.resources ?? defaultResources({ serverName: SERVER_NAME, serverVersion: SERVER_VERSION });
     this.server = new Server(
       {
         name: SERVER_NAME,
@@ -128,6 +147,7 @@ export class BazaarMcpServer {
       {
         capabilities: {
           tools: {},
+          resources: {},
         },
       }
     );
@@ -177,6 +197,69 @@ export class BazaarMcpServer {
       }
 
       return { tools };
+    });
+
+    // Listing resolves each resource rather than returning a static catalogue,
+    // so the freshness it reports is real. These payloads are small and cheap
+    // to produce; a stale or invented `lastModified` would be worse than none.
+    this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+      resources: this.resources.map((descriptor) => {
+        const snapshot = snapshotResource(descriptor);
+        return {
+          uri: snapshot.uri,
+          name: snapshot.name,
+          title: snapshot.title,
+          description: snapshot.description,
+          mimeType: snapshot.mimeType,
+          ...(snapshot.lastModified
+            ? { annotations: { lastModified: snapshot.lastModified } }
+            : {}),
+          _meta: {
+            version: snapshot.version,
+            ...(snapshot.lastModified ? { lastModified: snapshot.lastModified } : {}),
+          },
+        };
+      }),
+    }));
+
+    this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+      const uri = request.params.uri;
+      const descriptor = this.resources.find((d) => d.uri === uri);
+      // A refusal to read is a protocol error, not a tool result: unlike a tool
+      // call, `ReadResourceResult` has no `isError` shape, so a payload faking
+      // one would be misread by clients. This is not a third entry in the
+      // MCP_ERROR_CODES vocabulary — that set answers "why did the money or the
+      // fetch fail", which is a different question from "no such resource".
+      if (!descriptor) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Unknown resource: ${uri}. Call resources/list for the available URIs.`
+        );
+      }
+
+      let snapshot;
+      try {
+        snapshot = snapshotResource(descriptor);
+      } catch (e: any) {
+        throw new McpError(
+          ErrorCode.InternalError,
+          `Failed to read resource ${uri}: ${e?.message ?? String(e)}`
+        );
+      }
+
+      return {
+        contents: [
+          {
+            uri: snapshot.uri,
+            mimeType: snapshot.mimeType,
+            text: snapshot.text,
+            _meta: {
+              version: snapshot.version,
+              ...(snapshot.lastModified ? { lastModified: snapshot.lastModified } : {}),
+            },
+          },
+        ],
+      };
     });
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
