@@ -1,5 +1,0 @@
----
-"lens": minor
----
-
-Bound every ingester cycle with a deadline so one slow upstream can no longer stall an ingester while every health signal still reports it as healthy. Each round of a venue loop (SDEX, AMM, Soroswap, Aquarius) or the snapshot appender now runs under `runCycleWithDeadline`: a cycle over its deadline is aborted at its next unit checkpoint, counted in the new `ingester_abandoned_cycles_total` metric (`venue`, `network` labels) and logged, and the following cycle starts only after the abandoned one has unwound — two cycles against the same venue can never overlap, and because every checkpoint sits *before* a write unit rather than inside one, an abandoned cycle can never leave a partial write. The per-ingester deadline is configurable via `INGEST_CYCLE_DEADLINE_MS` with `<VENUE>`/`<NETWORK>` overrides (0 disables it), venue adapters receive the cycle `AbortSignal` as an optional third `ingestPair` argument, and `startVenueAdapter` accepts an optional `stopSignal` so a loop can be stopped cleanly at a cycle boundary.
